@@ -26,6 +26,7 @@ parse_args() {
   #parameters
   esonly=false
   edot=false
+  apm=false
   # Parse the script parameters
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -41,6 +42,11 @@ parse_args() {
 
       --esonly)
         esonly=true
+        shift
+        ;;
+
+      --apm)
+        apm=true
         shift
         ;;
 
@@ -67,6 +73,10 @@ parse_args() {
         ;;
     esac
   done
+  if [ "$apm" = "true" ] && [ "$esonly" = "true" ]; then
+    echo "Error: --apm requires Kibana and cannot be combined with --esonly"
+    exit 1
+  fi
 }
 
 startup() {
@@ -101,6 +111,8 @@ startup() {
   kibana_container_name="kibana-local-dev${ES_LOCAL_DIR:+-${ES_LOCAL_DIR}}"
   # Kibana settings container name
   kibana_settings_container_name="kibana-local-settings${ES_LOCAL_DIR:+-${ES_LOCAL_DIR}}"
+  apm_container_name="apm-server${ES_LOCAL_DIR:+-${ES_LOCAL_DIR}}"
+  apm_setup_container_name="apm-setup${ES_LOCAL_DIR:+-${ES_LOCAL_DIR}}"
   # EDOT container name
   edot_container_name="edot-collector${ES_LOCAL_DIR:+-${ES_LOCAL_DIR}}"
   # Minimum disk space required for docker images + services (in GB)
@@ -293,6 +305,10 @@ generate_error_log() {
     fi
     if [ "$edot" = "true" ]; then
       echo "--edot parameter used"
+    fi
+    if [ "$apm" = "true" ]; then
+      echo "--apm parameter used"
+      docker_services="$docker_services $apm_container_name $apm_setup_container_name"
     fi
     get_os_info
   } >> "$error_file" 
@@ -497,6 +513,10 @@ check_docker_services() {
   check_container_running "$kibana_container_name"
   check_container_running "$kibana_settings_container_name"
   check_container_running "$edot_container_name"
+  if [ "$apm" = "true" ]; then
+    check_container_running "$apm_container_name"
+    check_container_running "$apm_setup_container_name"
+  fi
 }
 
 create_installation_folder() {
@@ -543,6 +563,15 @@ ES_LOCAL_URL=http://localhost:\${ES_LOCAL_PORT}
 ES_LOCAL_DISK_SPACE_REQUIRED=1gb
 ES_LOCAL_LICENSE_EXPIRE_DATE=$license_expire
 EOM
+
+  if [ "$apm" = "true" ]; then
+    cat >> .env <<- EOM
+APM_LOCAL_CONTAINER_NAME=$apm_container_name
+APM_LOCAL_SETUP_CONTAINER_NAME=$apm_setup_container_name
+APM_LOCAL_PORT=8200
+APM_LOCAL_URL=http://localhost:\${APM_LOCAL_PORT}
+EOM
+  fi
 
   if [ "$edot" = "true" ]; then
     cat >> .env <<- EOM
@@ -733,6 +762,12 @@ EOM
 EOM
   fi
 
+  if [ "$apm" = "true" ]; then
+    cat >> uninstall.sh <<- EOM
+  echo "- docker.elastic.co/apm/apm-server:${es_version}"
+EOM
+  fi
+
   cat >> uninstall.sh <<- EOM
   if ask_confirmation; then
     if docker rmi "docker.elastic.co/elasticsearch/elasticsearch:${es_version}" >/dev/null 2>&1; then
@@ -758,6 +793,16 @@ EOM
       echo "Image docker.elastic.co/elastic-agent/elastic-otel-collector:${es_version} removed successfully"
     else
       echo "Failed to remove image docker.elastic.co/elastic-agent/elastic-otel-collector:${es_version}. It might be in use."
+    fi
+EOM
+  fi
+
+  if [ "$apm" = "true" ]; then
+    cat >> uninstall.sh <<- EOM
+    if docker rmi docker.elastic.co/apm/apm-server:${es_version} >/dev/null 2>&1; then
+      echo "Image docker.elastic.co/apm/apm-server:${es_version} removed successfully"
+    else
+      echo "Failed to remove image docker.elastic.co/apm/apm-server:${es_version}. It might be in use."
     fi
 EOM
   fi
@@ -879,6 +924,57 @@ add_edot_service_in_docker_composer() {
 EOM
 }
 
+# Install integration assets before starting the standalone APM Server.
+add_apm_services_in_docker_compose() {
+  cat >> docker-compose.yml <<-'EOM'
+  apm-setup:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${ES_LOCAL_VERSION}
+    container_name: ${APM_LOCAL_SETUP_CONTAINER_NAME}
+    depends_on:
+      kibana:
+        condition: service_healthy
+    restart: 'no'
+    command: |
+      bash -c '
+        start_time=$$(date +%s);
+        until curl --noproxy "*" --fail --silent --show-error --max-time 30 \
+          -u "elastic:${ES_LOCAL_PASSWORD}" \
+          -X POST http://kibana:5601/api/fleet/epm/packages/apm \
+          -H "kbn-xsrf: true" -H "Content-Type: application/json" -d "{}"; do
+          if [ $$(($$(date +%s) - $$start_time)) -ge 120 ]; then
+            echo "Error: APM integration installation failed";
+            exit 1;
+          fi;
+          sleep 2;
+        done;
+      '
+
+  apm-server:
+    image: docker.elastic.co/apm/apm-server:${ES_LOCAL_VERSION}
+    container_name: ${APM_LOCAL_CONTAINER_NAME}
+    depends_on:
+      apm-setup:
+        condition: service_completed_successfully
+    ports:
+      - 127.0.0.1:${APM_LOCAL_PORT}:8200
+    command:
+      - -e
+      - -E
+      - apm-server.host=0.0.0.0:8200
+      - -E
+      - apm-server.auth.api_key.enabled=true
+      - -E
+      - apm-server.auth.anonymous.enabled=false
+      - -E
+      - output.elasticsearch.hosts=["http://elasticsearch:9200"]
+      - -E
+      - output.elasticsearch.username=elastic
+      - -E
+      - output.elasticsearch.password=${ES_LOCAL_PASSWORD}
+
+EOM
+}
+
 create_docker_compose_file() {
   # Create the docker-compose.yml file
   if [ "$edot" = "true" ]; then
@@ -986,7 +1082,7 @@ if  [ "$esonly" = "false" ]; then
 EOM
 
 # Customize the default solution for spaces
-if [ "$edot" = "true" ]; then
+if [ "$edot" = "true" ] || [ "$apm" = "true" ]; then
   cat >> docker-compose.yml <<-'EOM'
       - MONITORING_UI_CONTAINER_ELASTICSEARCH_ENABLED=true
       - XPACK_SPACES_DEFAULTSOLUTION=oblt
@@ -1014,6 +1110,10 @@ fi
 if [ "$edot" = "true" ]; then
   add_edot_service_in_docker_composer
 fi
+
+  if [ "$apm" = "true" ]; then
+    add_apm_services_in_docker_compose
+  fi
 
   cat >> docker-compose.yml <<-'EOM'
 volumes:
@@ -1049,6 +1149,9 @@ print_steps() {
     echo "⌛️ Setting up Elasticsearch and Kibana v${es_version}..."
   fi
   echo
+  if [ "$apm" = "true" ]; then
+    echo "- Installing the APM integration and APM Server"
+  fi
   echo "- Generated random passwords"
   echo "- Created the ${folder} folder containing the files:"
   echo "  - .env, with settings"
@@ -1085,6 +1188,46 @@ api_key() {
   fi
 }
 
+# The agent key only grants APM intake and central configuration access.
+setup_apm_api_key() {
+  if [ "$apm" != "true" ]; then
+    return
+  fi
+  echo "- Creating the APM agent API key"
+  if ! response=$(curl --noproxy '*' --fail --silent --show-error --max-time 30 \
+    -u "elastic:${es_password}" -X POST http://localhost:9200/_security/api_key \
+    -H 'Content-Type: application/json' \
+    -d '{"name":"start-local-apm-agent","role_descriptors":{"apm_agent":{"applications":[{"application":"apm","privileges":["event:write","config_agent:read"],"resources":["*"]}]}}}'); then
+    apm_failure "Error: could not create the APM agent API key"
+  fi
+  apm_api_key=$(printf '%s' "$response" | sed -n 's/.*"encoded"[[:space:]]*:[[:space:]]*"\([A-Za-z0-9+/=]*\)".*/\1/p')
+  if [ -z "$apm_api_key" ]; then
+    apm_failure "Error: Elasticsearch did not return an encoded APM API key"
+  fi
+  echo "APM_LOCAL_API_KEY=$apm_api_key" >> .env
+
+  # Check authenticated intake, not just that the HTTP listener is up.
+  echo "- Waiting for APM Server to accept events"
+  apm_start_time=$(date +%s)
+  until [ "$(curl --noproxy '*' --silent --max-time 5 -o /dev/null -w '%{http_code}' \
+    http://localhost:8200/intake/v2/events \
+    -H "Authorization: ApiKey $apm_api_key" -H 'Content-Type: application/x-ndjson' \
+    --data-binary '{"metadata":{"service":{"name":"start-local-setup","agent":{"name":"other","version":"1.0"}},"process":{"pid":1}}}
+' || true)" = "202" ]; do
+    if [ "$(($(date +%s) - apm_start_time))" -ge 120 ]; then
+      apm_failure "Error: APM Server timeout of 120 sec"
+    fi
+    sleep 2
+  done
+}
+
+apm_failure() {
+  echo "$1"
+  generate_error_log "$1" "$elasticsearch_container_name $kibana_container_name"
+  cleanup
+  exit 1
+}
+
 kibana_wait() {
   if [ "$need_wait_for_kibana" = true ]; then
     wait_for_kibana 120
@@ -1096,7 +1239,11 @@ success() {
   if  [ "$esonly" = "true" ]; then
     echo "🎉 Congrats, Elasticsearch is installed and running in Docker!"
   else
-    if [ "$edot" = "true" ]; then
+    if [ "$apm" = "true" ] && [ "$edot" = "true" ]; then
+      echo "🎉 Congrats, Elasticsearch, Kibana, APM Server and EDOT collector are installed and running in Docker!"
+    elif [ "$apm" = "true" ]; then
+      echo "🎉 Congrats, Elasticsearch, Kibana and APM Server are installed and running in Docker!"
+    elif [ "$edot" = "true" ]; then
       echo "🎉 Congrats, Elasticsearch, Kibana and EDOT collector are installed and running in Docker!"
     else
       echo "🎉 Congrats, Elasticsearch and Kibana are installed and running in Docker!"
@@ -1122,6 +1269,11 @@ success() {
     echo "https://www.elastic.co/guide/en/kibana/current/api-keys.html"
     echo
   fi
+  if [ "$apm" = "true" ]; then
+    echo "🔌 APM Server URL: http://localhost:8200"
+    echo "🔑 APM API key: $apm_api_key"
+    echo
+  fi
   echo "Learn more at https://github.com/elastic/start-local"
   echo
 }
@@ -1144,6 +1296,7 @@ main() {
   running_docker_compose
   api_key
   kibana_wait
+  setup_apm_api_key
   success
 }
 

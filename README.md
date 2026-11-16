@@ -93,6 +93,32 @@ This command will install the latest Elasticsearch, Kibana and EDOT collector.
 [Here](https://www.elastic.co/docs/reference/opentelemetry) you can find more information about
 Elastic Distributions of OpenTelemetry (EDOT).
 
+### Install APM Server and the APM integration (Docker)
+
+Use `--apm` to install Elasticsearch, Kibana, the APM integration assets, and a
+standalone APM Server:
+
+```bash
+./start-local.sh --apm
+```
+
+The installer prints the APM Server URL (`http://localhost:8200`) and an APM agent
+API key alongside the Elasticsearch and Kibana connection details. These are also
+saved as `APM_LOCAL_URL` and `APM_LOCAL_API_KEY` in `elastic-start-local/.env`.
+The agent key grants APM event ingestion and agent central configuration access.
+
+Configure your application's Elastic APM agent with:
+
+```bash
+export ELASTIC_APM_SERVER_URL=http://localhost:8200
+export ELASTIC_APM_API_KEY="your-generated-apm-api-key"
+```
+
+Open Kibana's **Observability → APM** to view your application's data.
+The generated start, stop, and uninstall scripts include APM Server.
+You can combine `--apm` with `--edot` and `-v`; `--apm --esonly` is unsupported.
+The `--apm` option is currently available only in `start-local.sh` (Docker).
+
 ### 🌐 Endpoints
 
 After running the script:
